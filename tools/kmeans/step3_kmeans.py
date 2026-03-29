@@ -111,11 +111,12 @@ def l2_row_normalize(a, eps=1e-12):
     return (a / (norms + eps)).astype(np.float32, copy=False)
 
 
-def train_kmeans(x, k, ngpu, niter=20):
+def train_kmeans(x, k, ngpu, niter=20, use_fp16=True):
     """
     Run KMeans on one or more GPUs (Faiss)
     x: float32 [n, d]
     k: number of clusters
+    use_fp16: use float16 on GPU to halve memory (recommended for large k or d)
     """
     d = x.shape[1]
     clus = faiss.Clustering(d, k)
@@ -126,21 +127,31 @@ def train_kmeans(x, k, ngpu, niter=20):
     clus.max_points_per_centroid = 10_000_000
 
     res = [faiss.StandardGpuResources() for _ in range(ngpu)]
+    # Limit temp memory per GPU to avoid OOM
+    for r in res:
+        r.setTempMemory(1024 * 1024 * 1024)  # 1GB temp memory
 
     flat_config = []
     for i in range(ngpu):
         cfg = faiss.GpuIndexFlatConfig()
-        cfg.useFloat16 = False
+        cfg.useFloat16 = use_fp16
         cfg.device = i
         flat_config.append(cfg)
+
+    print(f"[kmeans] k={k}, d={d}, ngpu={ngpu}, fp16={use_fp16}")
+    mem_per_gpu_mb = k * d * (2 if use_fp16 else 4) / 1024 / 1024
+    print(f"[kmeans] Estimated centroid memory (full): {mem_per_gpu_mb:.0f} MB")
+    print(f"[kmeans] Per GPU with sharding: {mem_per_gpu_mb / ngpu:.0f} MB")
 
     if ngpu == 1:
         index = faiss.GpuIndexFlatL2(res[0], d, flat_config[0])
     else:
-        indexes = [faiss.GpuIndexFlatL2(res[i], d, flat_config[i]) for i in range(ngpu)]
-        index = faiss.IndexReplicas()
-        for sub_index in indexes:
-            index.addIndex(sub_index)
+        # Use IndexShards to split centroids across GPUs (reduces per-GPU memory)
+        co = faiss.GpuMultipleClonerOptions()
+        co.shard = True
+        co.useFloat16 = use_fp16
+        cpu_index = faiss.IndexFlatL2(d)
+        index = faiss.index_cpu_to_all_gpus(cpu_index, co=co, ngpu=ngpu)
 
     # Train
     clus.train(x, index)

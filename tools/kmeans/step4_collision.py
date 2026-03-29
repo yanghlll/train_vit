@@ -8,11 +8,10 @@ import torch
 from torch import distributed
 from torch.nn.functional import normalize
 
-local_rank = int(os.getenv("LOCAL_RANK", "0"))
-world_size = int(os.getenv("WORLD_SIZE", "1"))
-# distributed.init_process_group(backend="nccl")
-torch.cuda.set_device(local_rank)
-rank = int(os.getenv("RANK", "0"))
+local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+world_size = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", "1")))
+rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
+# CUDA device set in main() to avoid segfault under srun
 torch.backends.cudnn.benchmark = True
 
 
@@ -56,6 +55,8 @@ def collect_input_paths(input_path: str):
 
 @torch.no_grad()
 def main():
+    torch.cuda.set_device(local_rank)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", "-i", help="Can be a directory (containing .npy) or a list file containing .npy paths")
     parser.add_argument("--class_center", "-c", required=True, help="class center (.npy)")

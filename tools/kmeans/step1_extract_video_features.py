@@ -2,37 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Video feature extraction using DALI + MetaCLIP-H/14 with checkpoint resume.
-Features are saved in order matching the input video list.
-
-Usage with DeepSpeed:
-    torchrun --nproc_per_node 8 step1_extract_video_features.py \
-        --input /video_vit/mp4_list.txt \
-        --output /output/features \
-        --batch_size 32 \
-        --num_frames 8 \
-        --chunk_size 1000
-
-    # Multi-node
-    deepspeed --num_gpus=8 --num_nodes=2 --hostfile=hostfile step1_extract_video_features.py \
-        --input /video_vit/mp4_list.txt \
-        --output /output/features \
-        --batch_size 32 \
-        --num_frames 8
-
-    # Example:
-    hostfile content:
-        worker1 slots=8
-        worker2 slots=8
-        ...
-
-    deepspeed \
-    --num_gpus=8 \
-    --num_nodes=12 \
-    --hostfile=hostfile step1_extract_video_features.py \
-    --input /video_vit/clips_HowTo100M_meta_llava_vit/list_all_valid_part_000 \
-    --output /video_vit/clips_HowTo100M_meta_llava_vit/output_list_all_valid_part_000 \
-    --batch_size 32 \
-    --num_frames 8
 """
 
 import argparse
@@ -41,23 +10,19 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
-import decord
 import numpy as np
 import torch
 import open_clip
+import decord  # Must be imported AFTER torch to avoid /dev/urandom fd issue under srun
 import nvidia.dali.fn as fn
 import nvidia.dali.types as types
 from nvidia.dali.pipeline import pipeline_def
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
-# Get distributed info from environment (set by DeepSpeed)
-rank = int(os.environ.get("RANK", "0"))
-local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
-# Set CUDA device
-if torch.cuda.is_available():
-    torch.cuda.set_device(local_rank)
+# Get distributed info from environment (compatible with SLURM srun and DeepSpeed)
+rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
+local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+world_size = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", "1")))
 
 
 class DALIWarper:
@@ -183,6 +148,7 @@ def dali_dataloader(
         "std": std,
     }
 
+    print(f"[Rank {rank}] Building DALI pipeline: device_id={local_rank}, py_num_workers={dali_py_workers}, num_threads={dali_num_threads}", flush=True)
     pipe = dali_pipeline(
         batch_size=batch_size,
         num_threads=dali_num_threads,
@@ -193,7 +159,9 @@ def dali_dataloader(
         prefetch_queue_depth=1,
         source_params=source_params,
     )
+    print(f"[Rank {rank}] DALI pipeline created, building...", flush=True)
     pipe.build()
+    print(f"[Rank {rank}] DALI pipeline built successfully", flush=True)
 
     dali_iter = DALIGenericIterator(
         pipelines=pipe,
@@ -212,7 +180,8 @@ def load_metaclip_h14(model_path: str):
     """Load MetaCLIP-H/14 model."""
     print(f"[Rank {rank}] Loading MetaCLIP-H/14 from {model_path}")
     model = open_clip.create_model("ViT-H-14-quickgelu")
-    state_dict = torch.load(model_path, map_location="cpu")
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     model.load_state_dict(state_dict)
     return model.cuda().eval()
 
@@ -334,6 +303,16 @@ def extract_features(
 
 
 def main(args):
+    import sys
+    # Force unbuffered output
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+    print(f"[Rank {rank}] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}, local_rank={local_rank}", flush=True)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        print(f"[Rank {rank}] CUDA device {local_rank} set", flush=True)
+
     if rank == 0:
         print("=" * 60)
         print("MetaCLIP-H/14 Video Feature Extraction")
@@ -457,17 +436,27 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Extract MetaCLIP-H/14 features from videos")
-    parser.add_argument("--input", required=True, help="Input video list")
-    parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--model_path", default="/vlm/pretrain_models/metaclip/metaclip_h_14.pt")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_frames", type=int, default=8)
-    parser.add_argument("--chunk_size", type=int, default=32 << 10)  # Save every 1024 videos
-    parser.add_argument("--dali_num_threads", type=int, default=2)
-    parser.add_argument("--dali_py_workers", type=int, default=8)
-    parser.add_argument("--decord_threads", type=int, default=1)
-    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank (set by DeepSpeed)")
+    import sys
+    print(f"[PID={os.getpid()}] Python started, parsing args...", flush=True)
+    try:
+        parser = argparse.ArgumentParser(description="Extract MetaCLIP-H/14 features from videos")
+        parser.add_argument("--input", required=True, help="Input video list")
+        parser.add_argument("--output", required=True, help="Output directory")
+        parser.add_argument("--model_path", default="/vlm/pretrain_models/metaclip/metaclip_h_14.pt")
+        parser.add_argument("--batch_size", type=int, default=32)
+        parser.add_argument("--num_frames", type=int, default=8)
+        parser.add_argument("--chunk_size", type=int, default=32 << 10)  # Save every 1024 videos
+        parser.add_argument("--dali_num_threads", type=int, default=2)
+        parser.add_argument("--dali_py_workers", type=int, default=8)
+        parser.add_argument("--decord_threads", type=int, default=1)
+        parser.add_argument("--local_rank", type=int, default=-1, help="Local rank (set by DeepSpeed)")
 
-    args = parser.parse_args()
-    main(args)
+        args = parser.parse_args()
+        print(f"[PID={os.getpid()}] Args parsed, calling main()...", flush=True)
+        main(args)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.exit(1)

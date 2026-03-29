@@ -4,6 +4,8 @@ import math
 import argparse
 import traceback
 import numpy as np
+
+import torch          # torch 必须在 decord 之前 import（srun 下避免 /dev/urandom fd 被覆盖导致 segfault）
 import decord
 
 try:
@@ -17,17 +19,14 @@ try:
 except ImportError:
     _HAS_PIL = False
 
-import torch
 from numpy.lib.format import open_memmap
-
-import numpy as np
 # ---- Your residual reader ----
 from hevc_feature_decoder_mv import HevcFeatureReader
 
-# ===== Added: Read distributed environment variables =====
-RANK = int(os.environ.get("RANK", "0"))
-LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
-WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+# ===== 分布式环境变量（兼容 SLURM srun 和 torchrun）=====
+RANK = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
+LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+WORLD_SIZE = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", "1")))
 # =====================================
 
 
@@ -258,12 +257,12 @@ def process_one_video_mv_res(
         I_pos = {0}
 
         # Read residual (Y channel), set I-frame position to 0
-        Tsel = T
         # --- Use HevcFeatureReader to strictly align with C side (read order and field layout determined by C side) ---
         rdr = HevcFeatureReader(video_path, nb_frames=seq_len, n_parallel=hevc_n_parallel)
         H, W = rdr.height, rdr.width
 
         T = int(seq_len)
+        Tsel = T
         fused_list = [None] * T  # Store fused [0,1] map for each frame, shape=(H,W)
 
         # Provide a utility: convert residual to Y channel (if BGR)
