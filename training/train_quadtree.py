@@ -170,7 +170,8 @@ class BatchEndCallBack:
 
     def __call__(self, global_step, lr_scheduler, list_loss_float,
                  batch_size, num_samples=None,
-                 total_tokens=0, scale_counts=None):
+                 total_tokens=0, scale_counts=None,
+                 grad_norm_backbone=0.0, grad_norm_pfc=0.0, embed_norm=0.0):
         for i in range(self.num_head):
             self.list_loss_metric[i].update(list_loss_float[i])
         if total_tokens > 0:
@@ -241,6 +242,16 @@ class BatchEndCallBack:
                         m.reset()
 
                 samples_info = f"samples: {num_samples}" if num_samples else ""
+
+                # Gradient norm + embedding norm
+                norm_str = ""
+                if grad_norm_backbone > 0 or embed_norm > 0:
+                    norm_str = f"grad_norm: bb={grad_norm_backbone:.4f} pfc={grad_norm_pfc:.4f} embed_norm: {embed_norm:.4f} "
+                    if self.tb_writer:
+                        self.tb_writer.add_scalar("grad_norm/backbone", grad_norm_backbone, global_step)
+                        self.tb_writer.add_scalar("grad_norm/pfc", grad_norm_pfc, global_step)
+                        self.tb_writer.add_scalar("embed_norm", embed_norm, global_step)
+
                 gpu_mem = ""
                 try:
                     mem_used = torch.cuda.max_memory_allocated() / 1024**3
@@ -251,7 +262,7 @@ class BatchEndCallBack:
                 except Exception:
                     pass
 
-                msg = f"{header}{progress}{time_info}{tok_str}{gpu_mem}{samples_info}{loss_str}"
+                msg = f"{header}{progress}{time_info}{tok_str}{norm_str}{gpu_mem}{samples_info}{loss_str}"
 
                 if rank == 0:
                     self.logger.info(msg)
@@ -506,25 +517,29 @@ def main():
             head_loss = pfc(head_embedding, head_label, random_diff) * loss_weight
             list_loss.append(head_loss)
 
+        # Embedding norm (before loss backward)
+        embed_norm = head_embedding.detach().norm(dim=-1).mean().item()
+
         is_accumulation_step = (global_step % args.backward_passes_per_step != 0)
         scaled_loss = sum(list_loss) / args.backward_passes_per_step
 
+        grad_norm_backbone = 0.0
+        grad_norm_pfc = 0.0
         if is_accumulation_step:
             with backbone_ddp_compiled.no_sync():
                 scaled_loss.backward()
         else:
             scaled_loss.backward()
             if global_step % args.backward_passes_per_step == 0:
-                clip_grad_norm_(backbone_ddp_compiled.parameters(), max_norm=5, norm_type=2)
+                grad_norm_backbone = clip_grad_norm_(backbone_ddp_compiled.parameters(), max_norm=5, norm_type=2).item()
                 for pfc in list_module_pfc:
-                    clip_grad_norm_(pfc.parameters(), max_norm=5, norm_type=2)
+                    grad_norm_pfc = max(grad_norm_pfc, clip_grad_norm_(pfc.parameters(), max_norm=5, norm_type=2).item())
                 opt.step()
                 opt.zero_grad(set_to_none=True)
 
         lr_scheduler.step()
 
         # ---- Logging via callback ----
-        # Collect token stats from current batch
         total_tokens = sum(batch.get("seq_lengths", [0]))
         scale_counts = {}
         for s, p in patches_by_scale.items():
@@ -538,6 +553,9 @@ def main():
             num_samples=num_samples,
             total_tokens=total_tokens,
             scale_counts=scale_counts,
+            grad_norm_backbone=grad_norm_backbone,
+            grad_norm_pfc=grad_norm_pfc,
+            embed_norm=embed_norm,
         )
 
         global_step += 1
