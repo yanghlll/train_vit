@@ -286,3 +286,24 @@ def onevision_encoder_video_codec():
         shard_id=0,
         dali_type="decord_residual",
     )
+
+
+@DATASET_REGISTRY.register()
+def hevc_gop32_video_codec():
+    """K710+SSV2 HEVC GOP=32 video dataset with MV+Res visidx.
+
+    Uses pre-extracted .visidx.npy from step3_generate_video_mv_residual_index.py.
+    12-column format: video_path label0..label9 visidx_path
+    500k classes (kmeans pseudo-labels), 762624 videos.
+    """
+    list_path = "/nfs-stor/haolin.yang/video_data/hevc_gop32_codec_train_list.txt"
+    return Property(
+        name="hevc_gop32_video_codec",
+        prefixes=[list_path],
+        num_classes=500000,
+        num_examples=762624,
+        num_shards=1,
+        shard_id=0,
+        dali_type="decord_residual",
+        random_diff=10,
+    )
