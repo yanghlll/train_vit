@@ -63,6 +63,29 @@ def k710_ssv2_univit_pfs_fix_ip_fix_size():
 
 
 @DATASET_REGISTRY.register()
+def hevc_gop32_quadtree():
+    """K710+SSV2 HEVC GOP=32 with quadtree CU selection (762K videos, 500K classes).
+
+    Uses pre-extracted cu_visidx.npz for multi-scale patch selection (16/32/64px).
+    QuadtreeVideoDataset loads cu_visidx.npz + video frames at native resolution.
+    """
+    return Property(
+        name="hevc_gop32_quadtree",
+        prefixes=[],
+        num_classes=500000,
+        num_examples=762624,
+        num_shards=world_size,
+        shard_id=rank,
+        dali_type="quadtree",
+        random_diff=10,
+        mp4_list_path="/nfs-stor/haolin.yang/video_data/hevc_gop32_video_list_all.txt",
+        label_list_path="/nfs-stor/haolin.yang/video_data/cluster_viz/all_labels.npy",
+        cu_visidx_src="_hevc_gop32",
+        cu_visidx_dst="_cu_selection_gop32",
+    )
+
+
+@DATASET_REGISTRY.register()
 def hevc_gop32_video_codec():
     """K710+SSV2 HEVC GOP=32 with MV+Res visidx (762K videos, 500K pseudo-label classes).
 
