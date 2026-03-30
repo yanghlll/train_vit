@@ -113,8 +113,9 @@ parser.add_argument("--vis_interval", type=int, default=10, help="Visualization 
 # ---------------------------
 
 parser.add_argument("--total_indices", type=int, default=2000, help="Visible indices total count / 可见索引总数")
-parser.add_argument("--target_num", type=int, default=1568, help="Sampled indices count / 采样索引个数")
-parser.add_argument("--must_num", type=int, default=196, help="Number of indices must be included (from front) / 必须包含的索引数 (前面)")
+parser.add_argument("--target_num", type=int, default=1960, help="Sampled indices count / 采样索引个数 (I-frames + P/B sampled)")
+parser.add_argument("--must_num", type=int, default=196, help="Patches per frame (14*14=196 for patch_size=16) / 每帧 patch 数")
+parser.add_argument("--i_frame_ids", nargs='+', type=int, default=[0, 32], help="I-frame indices to always include (GOP=32) / 必须全选的 I 帧编号")
 
 args = parser.parse_args()
 
@@ -449,24 +450,42 @@ def main():
                 mask_frame_sampling = (idx_range >= n1) & (idx_range < n2)
                 mask_collage = idx_range >= n2
 
-                # ---------- residual（前40%）: 生成 out 行 ----------
+                # ---------- residual: I-frames must-select + P/B random sample ----------
+                # I-frame indices: frame 0 and frame 32 (GOP=32), each has must_num patches
+                # visidx contains only P/B patches (I-frames have 0 energy)
+                # Total = 2 * must_num (I) + pb_keep (P/B) = target_num
                 if mask_residual.any():
-                    vis_a = visible_indices[mask_residual, :args.total_indices]
-                    must = vis_a[:, :args.must_num]
-                    candidates = vis_a[:, args.must_num:args.total_indices]
-                    k = max(0, args.target_num - args.must_num)
-                    k = min(k, candidates.size(1))
-                    if k > 0:
-                        scores = torch.rand(vis_a.size(0), candidates.size(1), device=dev)
-                        idx = scores.topk(k, dim=1).indices
-                        sampled = torch.gather(candidates, 1, idx)
-                        sel_a = torch.cat([must, sampled], dim=1)
+                    vis_a = visible_indices[mask_residual, :args.total_indices]  # [n, 2000]
+                    ppf = args.must_num  # patches_per_frame = 196
+                    i_frames = getattr(args, 'i_frame_ids', [0, 32])
+                    # Build I-frame patch indices: frame_id * ppf + [0, ppf)
+                    i_patches_list = []
+                    for fid in i_frames:
+                        i_patches_list.append(
+                            torch.arange(fid * ppf, fid * ppf + ppf, device=dev)
+                        )
+                    i_patches = torch.cat(i_patches_list)  # (392,)
+                    n_i = i_patches.shape[0]  # 392
+                    i_patches_batch = i_patches.unsqueeze(0).expand(vis_a.size(0), -1)  # [n, 392]
+
+                    # Sample P/B patches from visidx
+                    pb_keep = args.target_num - n_i  # 1568
+                    pb_keep = max(0, min(pb_keep, vis_a.size(1)))
+                    if pb_keep > 0:
+                        scores = torch.rand(vis_a.size(0), vis_a.size(1), device=dev)
+                        idx = scores.topk(pb_keep, dim=1).indices
+                        pb_sampled = torch.gather(vis_a, 1, idx)  # [n, 1568]
+                        sel_a = torch.cat([i_patches_batch, pb_sampled], dim=1)  # [n, 1960]
                     else:
-                        sel_a = must
+                        sel_a = i_patches_batch
+
+                    # Sort for consistent ordering
+                    sel_a = torch.sort(sel_a, dim=1).values
+
                     if sel_a.size(1) < args.target_num:
                         pad = sel_a[:, -1:].repeat(1, args.target_num - sel_a.size(1))
                         sel_a = torch.cat([sel_a, pad], dim=1)
-                    out[mask_residual] = sel_a
+                    out[mask_residual] = sel_a[:, :args.target_num]
 
                 # ---------- frame_sampling（中40%）: 生成 out 行 ----------
                 if mask_frame_sampling.any():

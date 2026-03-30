@@ -53,7 +53,8 @@ torchrun --master_addr $master_addr --master_port $master_port \
   --finetune_backbone 1 \
   --backward_passes_per_step 1 \
   --total_indices 2000 \
-  --target_num 2000 \
+  --target_num 1960 \
   --must_num 196 \
+  --i_frame_ids 0 32 \
   --ckpt_interval 2000 \
   --frequent 10
