@@ -210,7 +210,7 @@ class QuadtreeViTEncoder(nn.Module):
         act_layer=nn.GELU,
         use_gradient_checkpointing=False,
         attn_dropout=0.0,
-        norm_cls=nn.RMSNorm,
+        norm_cls=nn.LayerNorm,
         use_head=True,
     ):
         super().__init__()
@@ -418,7 +418,7 @@ def quadtree_encoder_small_patch16_224(pretrained=False, **kwargs):
     return QuadtreeViTEncoder(
         patch_size=16, hidden_size=384, head_dim=64,
         num_hidden_layers=12, intermediate_size=1536,
-        act_layer=nn.GELU, norm_cls=nn.RMSNorm, use_head=True,
+        act_layer=nn.GELU, norm_cls=nn.LayerNorm, use_head=True,
     )
 
 @register_model
@@ -426,5 +426,5 @@ def quadtree_encoder_base_patch16_224(pretrained=False, **kwargs):
     return QuadtreeViTEncoder(
         patch_size=16, hidden_size=768, head_dim=64,
         num_hidden_layers=12, intermediate_size=3072,
-        act_layer=nn.GELU, norm_cls=nn.RMSNorm, use_head=True,
+        act_layer=nn.GELU, norm_cls=nn.LayerNorm, use_head=True,
     )
