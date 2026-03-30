@@ -60,4 +60,31 @@ def k710_ssv2_univit_pfs_fix_ip_fix_size():
         shard_id=rank,
         dali_type="decord"
     )
+
+
+@DATASET_REGISTRY.register()
+def hevc_gop32_video_codec():
+    """K710+SSV2 HEVC GOP=32 with MV+Res visidx (762K videos, 500K pseudo-label classes).
+
+    file_list: video paths from hevc_gop32_video_list_all.txt
+    all_labels: (762624, 10) int64 from all_labels.npy
+    visidx: per-video .visidx.npy via path replacement _hevc_gop32 -> _residual_mv_gop32
+    """
+    video_list_path = "/nfs-stor/haolin.yang/video_data/hevc_gop32_video_list_all.txt"
+    labels_path = "/nfs-stor/haolin.yang/video_data/cluster_viz/all_labels.npy"
+
+    with open(video_list_path, "r") as f:
+        lines = [l.strip() for l in f if l.strip()]
+
+    return Property(
+        name="hevc_gop32_video_codec",
+        prefixes=lines,
+        num_classes=500000,
+        num_examples=len(lines),
+        num_shards=world_size,
+        shard_id=rank,
+        dali_type="decord_hevc_gop32",
+        random_diff=10,
+        label_list_path=labels_path,
+    )
     

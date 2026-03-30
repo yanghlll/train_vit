@@ -329,6 +329,25 @@ def main():
                 num_shards=dataset_config.num_shards)
 
 
+        elif dataset_config.dali_type == "decord_hevc_gop32":
+            from dataloader.data_decord_hevc_gop32_residual_mv import dali_dataloader as gop32_dali_dataloader
+            import numpy as _np
+
+            _all_labels = _np.load(dataset_config.label_list_path)
+            train_iter = gop32_dali_dataloader(
+                file_list=dataset_config.prefixes,
+                all_labels=_all_labels,
+                dali_num_threads=4,
+                dali_py_num_workers=8,
+                batch_size=args.list_batch_sizes[head_id],
+                sequence_length=args.num_frames,
+                seed=0 + rank,
+                num_shards=dataset_config.num_shards,
+                shard_id=dataset_config.shard_id,
+                visidx_src="_hevc_gop32",
+                visidx_dst="_residual_mv_gop32",
+            )
+
         elif dataset_config.dali_type == "origin":
             if args.debug:
                 from dataloader.data_v2 import SyntheticDataIter
@@ -409,7 +428,7 @@ def main():
         for head_id, dataset_config in enumerate(args.list_datasets):
 
             dataset_config: Property
-            if dataset_config.dali_type in ["decord"]:
+            if dataset_config.dali_type in ["decord", "decord_hevc_gop32"]:
                 # 原始输入
                 head_input = list_data_batch[head_id]["pixel_values"]
                 list_batch_sizes.append(head_input.size(0))
