@@ -71,7 +71,7 @@ parser.add_argument("--list_lr_pfc_weights", nargs='+', type=float, default=[1.0
 parser.add_argument("--list_loss_weights", nargs='+', type=float, default=[1.0])
 parser.add_argument("--list_init_partial_fc_paths", nargs='+', type=str, default=["NULL"])
 parser.add_argument("--num_frames", type=int, default=64)
-parser.add_argument("--num_workers", type=int, default=4)
+parser.add_argument("--num_workers", type=int, default=8)
 parser.add_argument("--random_diff", type=int, default=10)
 
 # Model
@@ -431,6 +431,8 @@ def main():
             collate_fn=multigranularity_collate_fn,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=(args.num_workers > 0),
+            prefetch_factor=2 if args.num_workers > 0 else None,
         )
         list_dataloader.append((dl, sampler))
         logger.info(f"[head {head_id}] {dataset_config.name}: {len(ds)} videos, "

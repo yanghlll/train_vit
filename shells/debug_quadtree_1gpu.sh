@@ -4,7 +4,7 @@ set -e
 source /home/haolin.yang/.bashrc
 conda activate vit
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 export HEVC_FEAT_DECODER=/nfs-stor/haolin.yang/Code/VFM/Video_MLCD/codec-infra/hevc-quadtree/hevc
 
 cd /nfs-stor/haolin.yang/Code/VFM/Video_MLCD/LLava-ViT
@@ -21,7 +21,7 @@ torchrun --nproc_per_node 1 --master_port 29501 \
     --patch_size 16 \
     --num_frames 64 \
     --lr 1e-3 \
-    --num_sampled_data 1000 \
+    --num_sampled_data 2000 \
     --output /tmp/test_quadtree_train \
     --init_backbone NULL \
     --list_init_partial_fc_paths NULL \
