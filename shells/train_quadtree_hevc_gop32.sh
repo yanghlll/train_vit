@@ -41,7 +41,7 @@ torchrun --master_addr $master_addr --master_port $master_port \
   --patch_size 16 \
   --embedding_size 384 \
   --num_frames 64 \
-  --list_batch_sizes 4 \
+  --list_batch_sizes 32 \
   --lr 1e-3 \
   --weight_decay 0.05 \
   --warmup_ratio 0.1 \

@@ -25,9 +25,13 @@ from typing import List
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch import distributed
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -37,11 +41,11 @@ from training.checkpoint_utils import load_checkpoint, save_checkpoint
 from training.fused_partial_fc_v2 import CombinedMarginLoss, PartialFC_V2
 from training.lr_scheduler import PolynomialLRWarmup
 
-# Import quadtree components from model_factory
+# Import quadtree components
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "model_factory"))
-from multi_granularity_encoder import MultiGranularityOVEncoder
 from quadtree_dataset import QuadtreeVideoDataset
 from multigranularity_dataset import multigranularity_collate_fn
+from model_factory.vit_quadtree import QuadtreeViTEncoder
 
 torch._dynamo.config.optimize_ddp = False
 
@@ -106,7 +110,6 @@ rank = int(os.getenv("RANK", "0"))
 local_rank = int(os.getenv("LOCAL_RANK", "0"))
 world_size = int(os.getenv("WORLD_SIZE", "1"))
 distributed.init_process_group(backend="nccl")
-
 torch.cuda.set_device(local_rank)
 torch.backends.cudnn.benchmark = True
 
@@ -137,17 +140,126 @@ else:
 
 class ScalaMetric:
     def __init__(self):
-        self.sum = 0
-        self.count = 0
-    def update(self, v):
-        self.sum += v
-        self.count += 1
+        self.val = 0; self.avg = 0; self.sum = 0; self.count = 0
+    def update(self, val, n=1):
+        self.val = val; self.sum += val * n; self.count += n
+        self.avg = self.sum / self.count
     def reset(self):
-        self.sum = 0
-        self.count = 0
-    @property
-    def avg(self):
-        return self.sum / max(self.count, 1)
+        self.val = 0; self.avg = 0; self.sum = 0; self.count = 0
+
+
+class BatchEndCallBack:
+    """Logging callback aligned with LLaVA-ViT style."""
+    def __init__(self, frequent, list_head_names, output, total_steps, tb_writer=None):
+        self.frequent = frequent
+        self.list_head_names = list_head_names
+        self.output = output
+        self.total_steps = total_steps
+        self.num_head = len(list_head_names)
+        self.time_start = time.time()
+        self.list_loss_metric = [ScalaMetric() for _ in list_head_names]
+        self.tokens_metric = ScalaMetric()
+        self.scale_metrics = {16: ScalaMetric(), 32: ScalaMetric(), 64: ScalaMetric()}
+        self.init = False
+        self.tic = 0
+        self.step_times = []
+        self.max_time_history = 100
+        self.total_examples = 0
+        self.tb_writer = tb_writer if rank == 0 else None
+        self.logger = logging.getLogger(__name__)
+
+    def __call__(self, global_step, lr_scheduler, list_loss_float,
+                 batch_size, num_samples=None,
+                 total_tokens=0, scale_counts=None):
+        for i in range(self.num_head):
+            self.list_loss_metric[i].update(list_loss_float[i])
+        if total_tokens > 0:
+            self.tokens_metric.update(total_tokens)
+        if scale_counts:
+            for s, n in scale_counts.items():
+                if s in self.scale_metrics:
+                    self.scale_metrics[s].update(n)
+
+        if global_step > 0 and global_step % self.frequent == 0:
+            if self.init:
+                current_time = time.time()
+                time_elapsed = current_time - self.tic
+                self.tic = current_time
+
+                time_per_step = time_elapsed / self.frequent
+                self.step_times.append(time_per_step)
+                if len(self.step_times) > self.max_time_history:
+                    self.step_times.pop(0)
+
+                avg_time_per_step = sum(self.step_times) / len(self.step_times)
+                remaining_steps = self.total_steps - global_step
+                remaining_hours = (avg_time_per_step * remaining_steps) / 3600
+
+                try:
+                    speed = self.frequent * batch_size / time_elapsed
+                    speed_total = speed * world_size
+                except ZeroDivisionError:
+                    speed = speed_total = float("inf")
+
+                # Header
+                header = (f"rank {speed:.2f} total {speed_total:.2f} its/s "
+                          f"lr: {lr_scheduler.get_last_lr()[0]:.8f} ")
+                progress = (f"step: {global_step}/{self.total_steps} "
+                            f"({global_step/self.total_steps*100:.2f}%) ")
+                time_info = f"remain: {remaining_hours:.2f}h "
+
+                # Per-head loss + lr
+                loss_str = ""
+                for head_id, name in enumerate(self.list_head_names):
+                    if self.tb_writer:
+                        self.tb_writer.add_scalar(f"loss/{name}", self.list_loss_metric[head_id].avg, global_step)
+                        lr_idx = min(head_id + 1, len(lr_scheduler.get_last_lr()) - 1)
+                        self.tb_writer.add_scalar(f"lr/{name}", lr_scheduler.get_last_lr()[lr_idx], global_step)
+                        if num_samples:
+                            self.tb_writer.add_scalar(f"samples_vs_loss/{name}", self.list_loss_metric[head_id].avg, num_samples)
+                    loss_str += (f"\n  {f'head: {name}':<40}"
+                                 f"{f'loss: {self.list_loss_metric[head_id].avg:.4f}':<20}")
+                    self.list_loss_metric[head_id].reset()
+
+                # Token stats
+                tok_str = ""
+                if self.tokens_metric.count > 0:
+                    tok_str = f"tokens/batch: {self.tokens_metric.avg:.0f} "
+                    s_parts = []
+                    for s in [16, 32, 64]:
+                        if self.scale_metrics[s].count > 0:
+                            s_parts.append(f"{s}px={self.scale_metrics[s].avg:.0f}")
+                    if s_parts:
+                        tok_str += f"({', '.join(s_parts)}) "
+                    if self.tb_writer:
+                        self.tb_writer.add_scalar("tokens/batch_avg", self.tokens_metric.avg, global_step)
+                        for s in [16, 32, 64]:
+                            if self.scale_metrics[s].count > 0:
+                                self.tb_writer.add_scalar(f"tokens/scale_{s}px", self.scale_metrics[s].avg, global_step)
+                    self.tokens_metric.reset()
+                    for m in self.scale_metrics.values():
+                        m.reset()
+
+                samples_info = f"samples: {num_samples}" if num_samples else ""
+                gpu_mem = ""
+                try:
+                    mem_used = torch.cuda.max_memory_allocated() / 1024**3
+                    mem_total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+                    gpu_mem = f"gpu_mem: {mem_used:.1f}/{mem_total:.1f}GB "
+                    if self.tb_writer:
+                        self.tb_writer.add_scalar("gpu_mem_gb", mem_used, global_step)
+                except Exception:
+                    pass
+
+                msg = f"{header}{progress}{time_info}{tok_str}{gpu_mem}{samples_info}{loss_str}"
+
+                if rank == 0:
+                    self.logger.info(msg)
+                    if self.tb_writer:
+                        self.tb_writer.flush()
+            else:
+                self.init = True
+                self.tic = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -182,31 +294,27 @@ def main():
     for arg in vars(args):
         logger.info(f"{format(arg, '<30')}  {format(str(getattr(args, arg)))}")
 
-    # ---- Model: MultiGranularityOVEncoder ----
-    backbone = MultiGranularityOVEncoder(
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_layers,
-        num_attention_heads=args.num_heads,
-        intermediate_size=args.intermediate_size,
-        image_size=args.image_size,
+    # ---- Model: QuadtreeViTEncoder ----
+    backbone = QuadtreeViTEncoder(
         patch_size=args.patch_size,
-        gradient_checkpointing=args.gradient_checkpointing,
+        hidden_size=args.hidden_size,
+        head_dim=64,
+        num_hidden_layers=args.num_layers,
+        intermediate_size=args.intermediate_size,
+        act_layer=nn.GELU,
+        use_gradient_checkpointing=args.gradient_checkpointing,
+        norm_cls=nn.LayerNorm,
+        use_head=True,
     ).cuda().train()
 
     if args.init_backbone != "NULL":
         assert os.path.exists(args.init_backbone)
-        try:
-            from transformers import AutoModel
-            ov_model = AutoModel.from_pretrained(args.init_backbone, trust_remote_code=True)
-            backbone = MultiGranularityOVEncoder.from_pretrained_ov_encoder(ov_model).cuda().train()
-            del ov_model
-            logger.info(f"Loaded pretrained from {args.init_backbone}")
-        except Exception:
-            state_dict = torch.load(args.init_backbone, "cpu")
-            state_dict = {k.replace("_orig_mod.", "").replace("module.", ""): v
-                          for k, v in state_dict.items()}
-            backbone.load_state_dict(state_dict, strict=False)
-            logger.info(f"Loaded backbone weights from {args.init_backbone}")
+        state_dict = torch.load(args.init_backbone, "cpu")
+        state_dict = {k.replace("_orig_mod.", "").replace("module.", ""): v
+                      for k, v in state_dict.items()}
+        missing, unexpected = backbone.load_pretrained_base(state_dict)
+        logger.info(f"Loaded backbone from {args.init_backbone}, "
+                     f"missing={len(missing)}, unexpected={len(unexpected)}")
 
     backbone.requires_grad_(bool(args.finetune_backbone))
 
@@ -300,12 +408,14 @@ def main():
             cu_visidx_src=dataset_config.cu_visidx_src,
             cu_visidx_dst=dataset_config.cu_visidx_dst,
             num_frames=args.num_frames,
+            label_path=dataset_config.label_list_path,
         )
         sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
         dl = DataLoader(
             ds,
             batch_size=args.list_batch_sizes[head_id],
             sampler=sampler,
+            shuffle=False,
             num_workers=args.num_workers,
             collate_fn=multigranularity_collate_fn,
             pin_memory=True,
@@ -315,16 +425,24 @@ def main():
         logger.info(f"[head {head_id}] {dataset_config.name}: {len(ds)} videos, "
                      f"bs={args.list_batch_sizes[head_id]}")
 
-    if rank == 0:
+    if rank == 0 and SummaryWriter is not None:
         tb_writer = SummaryWriter(log_dir=f"{args.output}/tensorboard")
     else:
         tb_writer = None
+
+    batch_end_callback = BatchEndCallBack(
+        frequent=args.frequent,
+        list_head_names=[x.name for x in args.list_datasets],
+        output=args.output,
+        total_steps=args.total_steps,
+        tb_writer=tb_writer,
+    )
 
     # ---- Training loop ----
     list_iter = [iter(dl) for dl, _ in list_dataloader]
     list_loss_metric = [ScalaMetric() for _ in range(args.num_dataset_heads)]
     epoch = 0
-    time_start = time.time()
+    num_samples = 0
 
     if global_step > args.total_steps:
         logger.info("global_step > total_steps")
@@ -333,6 +451,7 @@ def main():
     while global_step <= args.total_steps:
         list_embedding = []
         list_labels = []
+        num_samples += args.batch_size * world_size
 
         for head_id, dataset_config in enumerate(args.list_datasets):
             # Get batch
@@ -354,9 +473,10 @@ def main():
             max_seqlen = batch["max_seqlen"]
             labels = batch["labels"].cuda(non_blocking=True)
 
-            # Forward
+            # Forward (unwrap DDP module for forward_packed)
+            fwd_module = backbone_ddp_compiled.module if hasattr(backbone_ddp_compiled, 'module') else backbone_ddp_compiled
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                _, pooled = backbone_ddp_compiled.module.forward_packed(
+                output = fwd_module.forward_packed(
                     patches_by_scale=patches_by_scale,
                     positions_thw=positions,
                     scale_indices=scale_indices,
@@ -364,6 +484,7 @@ def main():
                     max_seqlen=max_seqlen,
                 )
 
+            pooled = output["head_output"]
             if pooled is None:
                 logger.warning(f"[step {global_step}] pooled is None, skipping")
                 continue
@@ -384,7 +505,6 @@ def main():
             head_label = head_label[:, label_select:label_select + random_diff]
             head_loss = pfc(head_embedding, head_label, random_diff) * loss_weight
             list_loss.append(head_loss)
-            list_loss_metric[head_id].update(head_loss.item())
 
         is_accumulation_step = (global_step % args.backward_passes_per_step != 0)
         scaled_loss = sum(list_loss) / args.backward_passes_per_step
@@ -403,26 +523,22 @@ def main():
 
         lr_scheduler.step()
 
-        # ---- Logging ----
-        if rank == 0 and global_step % args.frequent == 0 and global_step > 0:
-            elapsed = time.time() - time_start
-            samples_per_sec = args.batch_size * world_size * args.frequent / max(elapsed, 1e-6)
-            lr = opt.param_groups[0]["lr"]
-            loss_strs = [f"{args.list_head_names[i]}={list_loss_metric[i].avg:.4f}"
-                         for i in range(args.num_dataset_heads)]
-            logger.info(
-                f"[step {global_step}/{args.total_steps}] "
-                f"loss=[{', '.join(loss_strs)}] lr={lr:.2e} "
-                f"samples/s={samples_per_sec:.0f} epoch={epoch}"
-            )
-            if tb_writer:
-                for i in range(args.num_dataset_heads):
-                    tb_writer.add_scalar(f"loss/{args.list_head_names[i]}",
-                                         list_loss_metric[i].avg, global_step)
-                tb_writer.add_scalar("lr", lr, global_step)
-            for m in list_loss_metric:
-                m.reset()
-            time_start = time.time()
+        # ---- Logging via callback ----
+        # Collect token stats from current batch
+        total_tokens = sum(batch.get("seq_lengths", [0]))
+        scale_counts = {}
+        for s, p in patches_by_scale.items():
+            scale_counts[s] = p.shape[0]
+
+        batch_end_callback(
+            global_step=global_step,
+            lr_scheduler=lr_scheduler,
+            list_loss_float=[l.item() for l in list_loss],
+            batch_size=args.batch_size,
+            num_samples=num_samples,
+            total_tokens=total_tokens,
+            scale_counts=scale_counts,
+        )
 
         global_step += 1
 

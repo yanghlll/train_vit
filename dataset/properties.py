@@ -52,6 +52,10 @@ class Property(EasyDict):
         mp4_list_path: Optional[str] = None,    # Path to mp4 list file / mp4列表文件路径
         label: Optional[np.ndarray] = None,      # Label array / 标签数组
         label_list_path: Optional[str] = None,  # Path to label list file / 标签列表文件路径
+
+        # For quadtree CU selection / 四叉树CU选择相关
+        cu_visidx_src: Optional[str] = None,    # Path replacement source for cu_visidx
+        cu_visidx_dst: Optional[str] = None,    # Path replacement dest for cu_visidx
     ):
         """
         Initialize dataset property object.
@@ -82,6 +86,8 @@ class Property(EasyDict):
         self.mp4_list_path = mp4_list_path
         self.label_list_path = label_list_path
         self.label = label
+        self.cu_visidx_src = cu_visidx_src
+        self.cu_visidx_dst = cu_visidx_dst
 
         # Validate dali_type to ensure it's a supported type
         # 验证 dali_type 以确保它是受支持的类型
@@ -92,6 +98,8 @@ class Property(EasyDict):
             # "video",
             # "parallel_rec",
             "decord",
+            "decord_hevc_gop32",
+            "quadtree",
             # "decord_torch",
         ]
         if self.dali_type not in valid_dali_types:
