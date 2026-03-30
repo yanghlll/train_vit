@@ -26,5 +26,5 @@ torchrun --nproc_per_node 1 --master_port 29501 \
     --init_backbone NULL \
     --list_init_partial_fc_paths NULL \
     --frequent 1 \
-    --num_workers 2 \
+    --num_workers 8 \
     --backward_passes_per_step 1

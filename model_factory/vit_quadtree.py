@@ -346,9 +346,11 @@ class QuadtreeViTEncoder(nn.Module):
     ) -> dict:
         """Forward for packed variable-length sequences (multiple clips in one batch).
 
-        Same as forward() but pools per-clip using cu_seqlens.
+        Pads clips to max_seqlen and batches through Transformer in one pass.
+        Uses attention_mask to prevent cross-clip and padding attention.
         """
         device = positions_thw.device
+        D = self.hidden_size
 
         # 1. Multi-scale patch embedding
         embeddings_by_scale = self.patch_embed(
@@ -372,33 +374,46 @@ class QuadtreeViTEncoder(nn.Module):
         # 4. Continuous RoPE
         freqs = self.video_rope.forward_from_positions(positions_thw)  # (total_L, half)
 
-        # 5. Process each clip separately through transformer
+        # 5. Pad clips to max_seqlen and batch through Transformer
         num_clips = len(cu_seqlens) - 1
-        clip_outputs = []
+
+        # Build padded batch: (B, max_seqlen, D)
+        padded_tokens = hidden_states.new_zeros(num_clips, max_seqlen, D)
+        padded_freqs = freqs.new_zeros(num_clips, max_seqlen, freqs.shape[-1])
+        # Attention mask: True = masked (padding positions)
+        attn_mask = torch.ones(num_clips, max_seqlen, max_seqlen, dtype=torch.bool, device=device)
+
+        seq_lengths = []
         for i in range(num_clips):
             start = cu_seqlens[i].item()
             end = cu_seqlens[i + 1].item()
-            clip_tokens = hidden_states[start:end]        # (L_i, D)
-            clip_freqs = freqs[start:end].unsqueeze(0)    # (1, L_i, half)
+            L_i = end - start
+            seq_lengths.append(L_i)
+            padded_tokens[i, :L_i] = hidden_states[start:end]
+            padded_freqs[i, :L_i] = freqs[start:end]
+            # Unmask valid positions: attn_mask[i, :L_i, :L_i] = False
+            attn_mask[i, :L_i, :L_i] = False
 
-            x_in = clip_tokens.unsqueeze(0).permute(1, 0, 2)  # (L_i, 1, D)
-            out = self.transformer(x_in, rotary_pos_emb=clip_freqs)
-            out = out.permute(1, 0, 2).squeeze(0)  # (L_i, D)
-            clip_outputs.append(out)
-
-        all_output = torch.cat(clip_outputs, dim=0)  # (total_L, D)
+        # Transformer expects (L, B, C) format
+        x_in = padded_tokens.permute(1, 0, 2)  # (max_seqlen, B, D)
+        out = self.transformer(x_in, rotary_pos_emb=padded_freqs, attention_mask=attn_mask)
+        out = out.permute(1, 0, 2)  # (B, max_seqlen, D)
 
         # 6. Post-norm
-        all_output = self.ln_post(all_output)
+        out = self.ln_post(out)
 
-        # 7. Pooling per-clip
+        # 7. Unpad and concatenate back to packed format
+        all_output_parts = []
+        for i in range(num_clips):
+            all_output_parts.append(out[i, :seq_lengths[i]])
+        all_output = torch.cat(all_output_parts, dim=0)  # (total_L, D)
+
+        # 8. Pooling per-clip
         head_output = None
         if self.use_head:
             pooled_list = []
             for i in range(num_clips):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                clip_out = all_output[start:end].unsqueeze(0)  # (1, L_i, D)
+                clip_out = out[i, :seq_lengths[i]].unsqueeze(0)  # (1, L_i, D)
                 pooled = self.head(clip_out)  # (1, D)
                 pooled_list.append(pooled)
             head_output = torch.cat(pooled_list, dim=0)  # (num_clips, D)
