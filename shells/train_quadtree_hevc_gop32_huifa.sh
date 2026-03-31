@@ -17,6 +17,7 @@ source /home/haolin.yang/.bashrc
 conda activate /home/haolin.yang/.conda/envs/vit
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HEVC_FEAT_DECODER=/nfs-stor/haolin.yang/Code/VFM/Video_MLCD/codec-infra/hevc-quadtree/hevc
 
 cd /nfs-stor/haolin.yang/Code/VFM/Video_MLCD/LLava-ViT

@@ -93,8 +93,8 @@ def hevc_gop32_video_codec():
     all_labels: (762624, 10) int64 from all_labels.npy
     visidx: per-video .visidx.npy via path replacement _hevc_gop32 -> _residual_mv_gop32
     """
-    video_list_path = "/nfs-stor/haolin.yang/video_data/hevc_gop32_video_list_all.txt"
-    labels_path = "/nfs-stor/haolin.yang/video_data/cluster_viz/all_labels.npy"
+    video_list_path = "/nfs-stor/haolin.yang/video_data/hevc_gop32_video_list_filtered.txt"
+    labels_path = "/nfs-stor/haolin.yang/video_data/cluster_viz/all_labels_filtered.npy"
 
     with open(video_list_path, "r") as f:
         lines = [l.strip() for l in f if l.strip()]

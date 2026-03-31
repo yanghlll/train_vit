@@ -373,7 +373,7 @@ def main():
             fp16=False,
         )
         partial_fc.train().cuda()
-        list_module_pfc.append(torch.compile(partial_fc))
+        list_module_pfc.append(partial_fc)
         dict_pfc_modules[head_name] = partial_fc
 
         lr_pfc = args.lr * args.list_lr_pfc_weights[head_id]
@@ -413,7 +413,9 @@ def main():
             bucket_cap_mb=32, find_unused_parameters=True, static_graph=True)
 
     backbone_ddp = wrap_ddp(backbone)
-    backbone_ddp_compiled = torch.compile(backbone_ddp)
+    # Note: torch.compile disabled for quadtree — padded attention with variable
+    # max_seqlen causes inductor to allocate extra buffers leading to OOM.
+    backbone_ddp_compiled = backbone_ddp
 
     # ---- DataLoaders (PyTorch, not DALI) ----
     list_dataloader = []
