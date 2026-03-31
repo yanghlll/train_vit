@@ -5,7 +5,6 @@ Extends LlavaViTEncoder architecture with:
 1. MultiScalePatchEmbed (APT-style): 16/32/64px patch embedding with dual-path fusion
 2. ScaleEmbedding: per-token scale indicator
 3. Continuous RoPE: accepts non-integer (t, h, w) positions for variable-size patches
-4. forward_packed(): variable-length sequences with packed attention
 
 Reuses LLaVA-ViT's TransformerCausal, VideoRotaryEmbeddingSplit466, and
 Siglip2MultiheadAttentionPoolingHead.
@@ -65,11 +64,7 @@ def pi_resize_weight(original_weight: torch.Tensor, target_patch_size: int) -> t
 # ---------------------------------------------------------------------------
 
 class MultiScalePatchEmbed(nn.Module):
-    """APT-style multi-scale patch embedding: 16x16, 32x32, 64x64.
-
-    At initialization, produces identical output to base Conv2d for 16x16 patches.
-    32x32 and 64x64 use dual-path: coarse (resize→base_proj) + fine (sub-patches→aggregate).
-    """
+    """APT-style multi-scale patch embedding: 16x16, 32x32, 64x64."""
 
     def __init__(self, d_model: int, base_patch: int = 16, num_channels: int = 3):
         super().__init__()
@@ -79,12 +74,9 @@ class MultiScalePatchEmbed(nn.Module):
         self.base_proj = nn.Conv2d(num_channels, d_model, kernel_size=base_patch,
                                    stride=base_patch, bias=False)
 
-        # 32x32: aggregate 2x2=4 sub-patches
         self.aggregate_32 = nn.Conv1d(d_model, d_model, kernel_size=4, bias=True)
-        # 64x64: aggregate 4x4=16 sub-patches
         self.aggregate_64 = nn.Conv1d(d_model, d_model, kernel_size=16, bias=True)
 
-        # Zero-initialized MLP for dual-path fusion
         self.zero_mlp_32 = nn.Linear(d_model, d_model)
         nn.init.zeros_(self.zero_mlp_32.weight)
         nn.init.zeros_(self.zero_mlp_32.bias)
@@ -130,7 +122,6 @@ class MultiScalePatchEmbed(nn.Module):
         return coarse + self.zero_mlp_64(fine)
 
     def forward(self, patches_16=None, patches_32=None, patches_64=None):
-        """Returns dict: {scale: (N_scale, d_model)}"""
         result = {}
         if patches_16 is not None and patches_16.shape[0] > 0:
             result[16] = self.embed_16x16(patches_16)
@@ -146,7 +137,6 @@ class MultiScalePatchEmbed(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ScaleEmbedding(nn.Module):
-    """Learned per-token scale embedding. Index: 1→16px, 2→32px, 3→64px."""
     def __init__(self, d_model: int, num_scales: int = 4):
         super().__init__()
         self.embed = nn.Embedding(num_scales, d_model)
@@ -160,32 +150,26 @@ class ScaleEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ContinuousVideoRoPE(VideoRotaryEmbeddingSplit466):
-    """Extends VideoRotaryEmbeddingSplit466 with continuous (non-integer) position support."""
-
     @torch.no_grad()
     def forward_from_positions(self, positions_thw: torch.Tensor) -> torch.Tensor:
         """Compute RoPE from continuous (t, h, w) positions.
-
-        Args:
-            positions_thw: (L, 3) float tensor
-
-        Returns:
-            freqs: (L, half) frequency tensor
+        Args: positions_thw: (L, 3) or (B, L, 3) float tensor
+        Returns: freqs: same leading dims + (half,)
         """
         device = positions_thw.device
         inv_t = self.inv_freq_t.to(device=device)
         inv_h = self.inv_freq_h.to(device=device)
         inv_w = self.inv_freq_w.to(device=device)
 
-        t_pos = positions_thw[:, 0].float()
-        h_pos = positions_thw[:, 1].float()
-        w_pos = positions_thw[:, 2].float()
+        t_pos = positions_thw[..., 0].float()
+        h_pos = positions_thw[..., 1].float()
+        w_pos = positions_thw[..., 2].float()
 
-        ft = torch.outer(t_pos, inv_t)  # (L, t_size)
-        fh = torch.outer(h_pos, inv_h)  # (L, h_size)
-        fw = torch.outer(w_pos, inv_w)  # (L, w_size)
+        ft = torch.einsum("...s,d->...sd", t_pos, inv_t)
+        fh = torch.einsum("...s,d->...sd", h_pos, inv_h)
+        fw = torch.einsum("...s,d->...sd", w_pos, inv_w)
 
-        return torch.cat([ft, fh, fw], dim=-1)  # (L, half)
+        return torch.cat([ft, fh, fw], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +179,10 @@ class ContinuousVideoRoPE(VideoRotaryEmbeddingSplit466):
 class QuadtreeViTEncoder(nn.Module):
     """Multi-scale ViT encoder using LLaVA-ViT architecture.
 
-    Replaces uniform Conv2d with MultiScalePatchEmbed (16/32/64px).
-    Uses continuous RoPE for variable-size patch positions.
-    Reuses LLaVA-ViT's TransformerCausal and Siglip2 pooling head.
+    All samples have FIXED token count (target_num), so:
+    - No padding, no attention mask
+    - Direct batch forward through Transformer
+    - Same as LlavaViTEncoder but with multi-scale patch embedding
     """
 
     def __init__(
@@ -222,19 +207,13 @@ class QuadtreeViTEncoder(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.patch_size = patch_size
 
-        # Multi-scale patch embedding (replaces conv1)
         self.patch_embed = MultiScalePatchEmbed(
             d_model=hidden_size, base_patch=patch_size, num_channels=3
         )
-
-        # Scale embedding
         self.scale_embed = ScaleEmbedding(d_model=hidden_size, num_scales=4)
-
-        # Pre/Post normalization
         self.ln_pre = norm_cls(hidden_size)
         self.ln_post = norm_cls(hidden_size)
 
-        # Transformer (same as LlavaViTEncoder)
         self.transformer = TransformerCausal(
             hidden_size=hidden_size,
             num_hidden_layers=num_hidden_layers,
@@ -246,10 +225,8 @@ class QuadtreeViTEncoder(nn.Module):
             norm_cls=norm_cls,
         )
 
-        # Continuous RoPE (supports non-integer positions)
         self.video_rope = ContinuousVideoRoPE(head_dim)
 
-        # Pooling head
         self.use_head = use_head
         if use_head:
             self.head = Siglip2MultiheadAttentionPoolingHead(
@@ -268,10 +245,9 @@ class QuadtreeViTEncoder(nn.Module):
             elif k.startswith("conv1."):
                 new_sd[k.replace("conv1.", "patch_embed.base_proj.")] = v
             elif k == "class_embedding":
-                continue  # not used in quadtree
+                continue
             else:
                 new_sd[k] = v
-
         missing, unexpected = self.load_state_dict(new_sd, strict=False)
         return missing, unexpected
 
@@ -281,60 +257,38 @@ class QuadtreeViTEncoder(nn.Module):
         positions_thw: torch.Tensor,
         scale_indices: torch.Tensor,
     ) -> dict:
-        """Forward pass for batched variable-length multi-scale sequences.
-
+        """Single-clip forward.
         Args:
-            patches_by_scale: {16: (N16, C, 16, 16), 32: (N32, C, 32, 32), 64: (N64, C, 64, 64)}
-            positions_thw: (total_L, 3) continuous positions [t, h, w]
-            scale_indices: (total_L,) scale index per token (1=16, 2=32, 3=64)
-
-        Returns:
-            dict with "visible_embeddings" and "head_output"
+            patches_by_scale: {16: (N16,C,16,16), 32: (N32,C,32,32), 64: (N64,C,64,64)}
+            positions_thw: (L, 3) continuous positions
+            scale_indices: (L,) scale index per token
         """
-        device = positions_thw.device
-
         # 1. Multi-scale patch embedding
         embeddings_by_scale = self.patch_embed(
             patches_16=patches_by_scale.get(16),
             patches_32=patches_by_scale.get(32),
             patches_64=patches_by_scale.get(64),
         )
+        token_parts = [embeddings_by_scale[s] for s in [16, 32, 64] if s in embeddings_by_scale]
+        hidden_states = torch.cat(token_parts, dim=0)  # (L, D)
 
-        # Concatenate in scale order (16 → 32 → 64)
-        token_parts = []
-        for scale in [16, 32, 64]:
-            if scale in embeddings_by_scale:
-                token_parts.append(embeddings_by_scale[scale])
-        hidden_states = torch.cat(token_parts, dim=0)  # (total_L, D)
-
-        # 2. Add scale embedding
+        # 2. Scale + pre-norm
         hidden_states = hidden_states + self.scale_embed(scale_indices)
-
-        # 3. Pre-norm
         hidden_states = self.ln_pre(hidden_states)
 
-        # 4. Continuous RoPE
-        freqs = self.video_rope.forward_from_positions(positions_thw)  # (total_L, half)
-        # Expand to (1, total_L, half) for batch dim
-        freqs = freqs.unsqueeze(0)
+        # 3. RoPE
+        freqs = self.video_rope.forward_from_positions(positions_thw)  # (L, half)
 
-        # 5. Transformer (expects (N, B, C) format)
-        x_in = hidden_states.unsqueeze(0).permute(1, 0, 2)  # (total_L, 1, D)
-        out = self.transformer(x_in, rotary_pos_emb=freqs)
-        out = out.permute(1, 0, 2).squeeze(0)  # (total_L, D)
+        # 4. Transformer (L, 1, D)
+        x_in = hidden_states.unsqueeze(0).permute(1, 0, 2)
+        out = self.transformer(x_in, rotary_pos_emb=freqs.unsqueeze(0))
+        out = out.permute(1, 0, 2).squeeze(0)  # (L, D)
 
-        # 6. Post-norm
+        # 5. Post-norm + pooling
         out = self.ln_post(out)
+        head_output = self.head(out.unsqueeze(0)).squeeze(0) if self.use_head else None
 
-        # 7. Pooling head
-        head_output = None
-        if self.use_head:
-            head_output = self.head(out.unsqueeze(0)).squeeze(0)  # (D,)
-
-        return {
-            "visible_embeddings": out,
-            "head_output": head_output,
-        }
+        return {"visible_embeddings": out, "head_output": head_output}
 
     def forward_packed(
         self,
@@ -344,13 +298,15 @@ class QuadtreeViTEncoder(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> dict:
-        """Forward for packed variable-length sequences (multiple clips in one batch).
+        """Batched forward for FIXED-length sequences (all clips have same token count).
 
-        Pads clips to max_seqlen and batches through Transformer in one pass.
-        Uses attention_mask to prevent cross-clip and padding attention.
+        No padding, no attention mask — all clips are the same length (target_num).
+        Reshapes packed (total_L, D) into (B, L, D) and batch-forwards through Transformer.
         """
         device = positions_thw.device
         D = self.hidden_size
+        num_clips = len(cu_seqlens) - 1
+        L = max_seqlen  # all clips have same length
 
         # 1. Multi-scale patch embedding
         embeddings_by_scale = self.patch_embed(
@@ -358,70 +314,41 @@ class QuadtreeViTEncoder(nn.Module):
             patches_32=patches_by_scale.get(32),
             patches_64=patches_by_scale.get(64),
         )
-
-        token_parts = []
-        for scale in [16, 32, 64]:
-            if scale in embeddings_by_scale:
-                token_parts.append(embeddings_by_scale[scale])
+        token_parts = [embeddings_by_scale[s] for s in [16, 32, 64] if s in embeddings_by_scale]
         hidden_states = torch.cat(token_parts, dim=0)  # (total_L, D)
 
-        # 2. Scale embedding
+        # 2. Scale embedding + pre-norm
         hidden_states = hidden_states + self.scale_embed(scale_indices)
-
-        # 3. Pre-norm
         hidden_states = self.ln_pre(hidden_states)
 
-        # 4. Continuous RoPE
+        # 3. RoPE
         freqs = self.video_rope.forward_from_positions(positions_thw)  # (total_L, half)
 
-        # 5. Pad clips to max_seqlen and batch through Transformer
-        num_clips = len(cu_seqlens) - 1
+        # 4. Reshape packed → batch: (total_L, D) → (B, L, D)
+        hidden_states = hidden_states.view(num_clips, L, D)
+        freqs = freqs.view(num_clips, L, -1)
 
-        # Build padded batch: (B, max_seqlen, D)
-        padded_tokens = hidden_states.new_zeros(num_clips, max_seqlen, D)
-        padded_freqs = freqs.new_zeros(num_clips, max_seqlen, freqs.shape[-1])
-        # Attention mask: True = masked (padding positions)
-        attn_mask = torch.ones(num_clips, max_seqlen, max_seqlen, dtype=torch.bool, device=device)
-
-        seq_lengths = []
-        for i in range(num_clips):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
-            L_i = end - start
-            seq_lengths.append(L_i)
-            padded_tokens[i, :L_i] = hidden_states[start:end]
-            padded_freqs[i, :L_i] = freqs[start:end]
-            # Unmask valid positions: attn_mask[i, :L_i, :L_i] = False
-            attn_mask[i, :L_i, :L_i] = False
-
-        # Transformer expects (L, B, C) format
-        x_in = padded_tokens.permute(1, 0, 2)  # (max_seqlen, B, D)
-        out = self.transformer(x_in, rotary_pos_emb=padded_freqs, attention_mask=attn_mask)
-        out = out.permute(1, 0, 2)  # (B, max_seqlen, D)
+        # 5. Transformer: expects (L, B, D)
+        x_in = hidden_states.permute(1, 0, 2)  # (L, B, D)
+        out = self.transformer(x_in, rotary_pos_emb=freqs)  # no attention_mask needed
+        out = out.permute(1, 0, 2)  # (B, L, D)
 
         # 6. Post-norm
         out = self.ln_post(out)
 
-        # 7. Unpad and concatenate back to packed format
-        all_output_parts = []
-        for i in range(num_clips):
-            all_output_parts.append(out[i, :seq_lengths[i]])
-        all_output = torch.cat(all_output_parts, dim=0)  # (total_L, D)
-
-        # 8. Pooling per-clip
+        # 7. Pooling per-clip
         head_output = None
         if self.use_head:
             pooled_list = []
             for i in range(num_clips):
-                clip_out = out[i, :seq_lengths[i]].unsqueeze(0)  # (1, L_i, D)
-                pooled = self.head(clip_out)  # (1, D)
+                pooled = self.head(out[i:i+1])  # (1, D)
                 pooled_list.append(pooled)
-            head_output = torch.cat(pooled_list, dim=0)  # (num_clips, D)
+            head_output = torch.cat(pooled_list, dim=0)  # (B, D)
 
-        return {
-            "visible_embeddings": all_output,
-            "head_output": head_output,
-        }
+        # Flatten back for compatibility
+        all_output = out.reshape(-1, D)  # (total_L, D)
+
+        return {"visible_embeddings": all_output, "head_output": head_output}
 
 
 # ---------------------------------------------------------------------------

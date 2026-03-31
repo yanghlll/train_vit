@@ -42,9 +42,8 @@ from training.fused_partial_fc_v2 import CombinedMarginLoss, PartialFC_V2
 from training.lr_scheduler import PolynomialLRWarmup
 
 # Import quadtree components
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "model_factory"))
-from quadtree_dataset import QuadtreeVideoDataset
-from multigranularity_dataset import multigranularity_collate_fn
+from dataloader.quadtree_dataset import QuadtreeVideoDataset
+from dataloader.multigranularity_dataset import multigranularity_collate_fn
 from model_factory.vit_quadtree import QuadtreeViTEncoder
 
 torch._dynamo.config.optimize_ddp = False
