@@ -72,6 +72,10 @@ parser.add_argument("--list_loss_weights", nargs='+', type=float, default=[1.0])
 parser.add_argument("--list_init_partial_fc_paths", nargs='+', type=str, default=["NULL"])
 parser.add_argument("--num_frames", type=int, default=64)
 parser.add_argument("--num_workers", type=int, default=8)
+parser.add_argument("--target_num", type=int, default=1960,
+                    help="Fixed total tokens per sample (I-frame all + P/B sampled)")
+parser.add_argument("--i_frame_ids", nargs='+', type=int, default=[0, 32],
+                    help="I-frame indices to always fully select (GOP=32)")
 parser.add_argument("--random_diff", type=int, default=10)
 
 # Model
@@ -420,6 +424,8 @@ def main():
             cu_visidx_dst=dataset_config.cu_visidx_dst,
             num_frames=args.num_frames,
             label_path=dataset_config.label_list_path,
+            target_num=args.target_num,
+            i_frame_ids=tuple(args.i_frame_ids),
         )
         sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
         dl = DataLoader(

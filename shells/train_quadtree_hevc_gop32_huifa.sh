@@ -14,14 +14,13 @@
 set -e
 
 source /home/haolin.yang/.bashrc
-conda activate vit
+conda activate /home/haolin.yang/.conda/envs/vit
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HEVC_FEAT_DECODER=/nfs-stor/haolin.yang/Code/VFM/Video_MLCD/codec-infra/hevc-quadtree/hevc
 
 cd /nfs-stor/haolin.yang/Code/VFM/Video_MLCD/LLava-ViT
 
-# ---- Distributed config ----
 NNODES=${SLURM_NNODES:-1}
 GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-4}
 NODE_RANK=${SLURM_NODEID:-0}
@@ -32,17 +31,11 @@ OUTPUT_DIR="/nfs-stor/haolin.yang/Code/VFM/Video_MLCD/LLava-ViT/ckpts/quadtree_h
 mkdir -p "$OUTPUT_DIR"
 
 echo "=========================="
-echo "Quadtree CU Multi-Scale Training"
-echo "=========================="
-echo "Nodes: $NNODES, GPUs/node: $GPUS_PER_NODE, Node rank: $NODE_RANK"
-echo "Master: $MASTER_ADDR:$MASTER_PORT"
-echo "Dataset: hevc_gop32_quadtree (762K videos, 500K classes)"
-echo "Model: QuadtreeViTEncoder (small: 384d, 12L, LayerNorm)"
-echo "Effective batch: 16 x 4 (accum) x $GPUS_PER_NODE GPUs = $((16 * 4 * GPUS_PER_NODE))"
-echo "Output: $OUTPUT_DIR"
+echo "Quadtree CU Multi-Scale Training (huifa)"
+echo "Nodes: $NNODES, GPUs/node: $GPUS_PER_NODE"
+echo "Effective batch: 32 x 2 x $GPUS_PER_NODE = $((32 * 2 * GPUS_PER_NODE))"
 echo "=========================="
 
-# Optional: pretrained checkpoint
 init_backbone="${INIT_BACKBONE:-NULL}"
 
 torchrun \
@@ -82,5 +75,3 @@ torchrun \
   --num_workers 8 \
   --target_num 1960 \
   --i_frame_ids 0 32
-
-echo "Done: Quadtree training"
